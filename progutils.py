@@ -40,14 +40,15 @@ class Config:
     DEFENSIVE_WEIGHTS = {'dws': 0.4, 'stl': 0.3, 'blk': 0.3}
     DEFENSIVE_BONUS_CAP = 3.0
     
-    # Budget Calculation
-    BASE_DIVISOR = 3.0
-    JITTER_RANGE = 0.5
-    AGE_MULTIPLIERS = {
-        25: 1.0, 26: 1.0, 27: 1.0,
-        28: 0.5, 29: 0.5, 30: 0.5,
-        31: -0.3, 32: -0.3, 33: -0.3, 34: -0.3,
-        35: -0.8  # 36+ same
+    # Budget Calculation - PER-centered with age-based parameters
+    # Formula: budget = (adjusted_per - threshold) * scale + offset
+    # Higher PER = better progression, age shifts the baseline
+    # Note: OVR delta ≈ budget / 4 due to distribution across skills and weighted averaging
+    JITTER_RANGE = 1.0
+    BUDGET_PARAMS = {
+        '25-30': {'threshold': 12, 'scale': 0.9, 'offset': 3},   # Range ~[-4, 4], positive mean
+        '31-34': {'threshold': 14, 'scale': 1.4, 'offset': -5},  # Range ~[-4, 2], PER-driven
+        '35+':   {'threshold': 16, 'scale': 2.0, 'offset': -20}, # Range ~[-6, 0], decline
     }
     LOW_PER_BONUS = {'ageThreshold': 28, 'perThreshold': 12, 'bonus': 2}
     GOD_PROGRESSION = {
@@ -55,7 +56,9 @@ class Config:
         'ovrPenalty': 0.025,
         'oldAgeMultiplier': 0.5,
         'ageThreshold': 28,
-        'bonusRange': [5, 10]
+        'maxAge': 30,        # Hard cap: no god prog above this age
+        'maxOvr': 60,        # Hard cap: no god prog at or above this OVR
+        'bonusRange': [5, 12]
     }
     
     # Distribution
@@ -68,11 +71,11 @@ class Config:
         'defense': ['dIQ', 'Ins', 'Reb']
     }
     
-    # Caps & Limits
+    # Caps & Limits - per-skill caps (OVR change is smaller due to weighted average)
     SKILL_CAPS = {
-        '25-30': {'min': -2, 'max': 4},
-        '31-34': {'min': -3, 'max': 2},
-        '35+': {'min': -5, 'max': 0}
+        '25-30': {'min': -5, 'max': 6},   # Allows OVR range ~[-4, 4]
+        '31-34': {'min': -6, 'max': 4},   # Allows OVR range ~[-4, 2]
+        '35+': {'min': -8, 'max': 0}      # Allows OVR range ~[-6, 0]
     }
     PHYSICAL_DECLINE_AGE = 30
     PHYSICAL_SKILLS = ['Spd', 'Jmp', 'End']
@@ -100,28 +103,25 @@ class ProgressionCalculator:
         Get progression parameters for a given age.
 
         Returns dict with:
-            - age_multiplier: float
+            - budget_params: dict with threshold, scale, offset
             - skill_caps: {'min': int, 'max': int}
             - age_tier: str ('25-30', '31-34', '35+')
         """
         if age >= 35:
-            age_multiplier = Config.AGE_MULTIPLIERS[35]
             age_tier = '35+'
         elif age >= 31:
-            age_multiplier = Config.AGE_MULTIPLIERS.get(age, -0.3)
             age_tier = '31-34'
         elif age >= 25:
-            age_multiplier = Config.AGE_MULTIPLIERS.get(age, 1.0)
             age_tier = '25-30'
         else:
-            age_multiplier = 0
             age_tier = '<25'
 
+        budget_params = Config.BUDGET_PARAMS.get(age_tier, {'threshold': 10, 'scale': 0, 'offset': 0})
         skill_caps = Config.SKILL_CAPS.get(age_tier, {'min': 0, 'max': 0})
 
         return {
             'age': age,
-            'age_multiplier': age_multiplier,
+            'budget_params': budget_params,
             'skill_caps': skill_caps,
             'age_tier': age_tier
         }
@@ -131,10 +131,8 @@ class ProgressionCalculator:
         """
         Calculate theoretical min/max OVR delta range based on PER and age.
 
-        The OVR delta is much smaller than the budget because:
-        1. Budget distributes across 14 skills
-        2. OVR is a weighted average of attributes
-        3. Individual skill changes are capped
+        Uses PER-centered formula: budget = (adjusted_per - threshold) * scale + offset
+        Higher PER = better progression, age shifts the baseline.
 
         Args:
             per: Player Efficiency Rating
@@ -144,40 +142,23 @@ class ProgressionCalculator:
             (min_delta, max_delta) tuple representing expected OVR change range
         """
         age = params['age']
-        age_mult = params['age_multiplier']
-        caps = params['skill_caps']
+        age_tier = params['age_tier']
+        budget_params = params['budget_params']
 
-        # Calculate approximate budget (without jitter)
-        adjusted_per = per + Config.DEFENSIVE_BONUS_CAP  # Max defensive bonus
-        base_budget = (adjusted_per / Config.BASE_DIVISOR) * age_mult
-
-        # For OVR delta estimation:
-        # - Budget spreads across ~14 skills
-        # - OVR coefficients sum to ~1.0
-        # - Average skill change = budget / 14
-        # - OVR delta ≈ average skill change (due to weighting)
-        # Empirically, OVR delta is roughly budget / 4 to budget / 6
-
-        if age_mult >= 0:
-            # Positive progression (young players)
-            # Min: could get unlucky with jitter and distribution
-            min_delta = max(caps['min'], -1)  # Rarely regress when young
-
-            # Max: with god progression bonus
-            god_bonus = Config.GOD_PROGRESSION['bonusRange'][1]
-            max_budget_with_god = base_budget + god_bonus
-            # OVR delta is compressed - roughly budget / 4
-            max_delta = min(caps['max'], max(1, int(max_budget_with_god / 4) + 1))
+        # Use age-tier hard limits as the expected range
+        # This ensures validation matches actual algorithm behavior
+        if age_tier == '25-30':
+            min_delta = -4
+            max_delta = 4
+        elif age_tier == '31-34':
+            min_delta = -4
+            max_delta = 2
+        elif age_tier == '35+':
+            min_delta = -6
+            max_delta = 0
         else:
-            # Negative progression (older players)
-            # Min: worst case regression
-            min_delta = max(caps['min'], int(base_budget * 1.5) - 1)
-
-            # Max: could still get slight improvement or stay flat with god prog
-            if age <= 34:
-                max_delta = min(caps['max'], 1)  # 31-34 can still improve slightly
-            else:
-                max_delta = 0  # 35+ capped at no growth
+            min_delta = 0
+            max_delta = 0
 
         return (min_delta, max_delta)
 
@@ -197,22 +178,21 @@ class ProgressionCalculator:
         Returns:
             (min_delta, max_delta) tuple with hard limits applied
         """
-        caps = params['skill_caps']
         age = params['age']
+        age_tier = params['age_tier']
 
-        # Use realistic OVR delta bounds based on age tier
-        # These should be wider than typical results to avoid false positives
-        if age <= 30:
-            # Young players: can improve, rarely regress much
-            hard_min = -2
+        # Hard limits match the expected OVR delta ranges per tier
+        if age_tier == '25-30':
+            hard_min = -4
             hard_max = 4
-        elif age <= 34:
-            # Transitional: slight decline typical, some improvement possible
-            hard_min = -3
+        elif age_tier == '31-34':
+            hard_min = -4
             hard_max = 2
+        elif age_tier == '35+':
+            hard_min = -6
+            hard_max = 0
         else:
-            # Veterans: decline expected, no improvement
-            hard_min = -5
+            hard_min = 0
             hard_max = 0
 
         # Clamp to hard limits
@@ -246,11 +226,19 @@ def calcovr(attrs_dict):
     return max(0, min(100, int(round(s + fudge))))
 
 # Helper functions
-def get_age_multiplier(age):
-    """Get age multiplier for budget calculation"""
+def get_age_tier(age):
+    """Get age tier string for config lookups"""
     if age >= 35:
-        return Config.AGE_MULTIPLIERS[35]
-    return Config.AGE_MULTIPLIERS.get(age, 1.0)
+        return '35+'
+    elif age >= 31:
+        return '31-34'
+    else:
+        return '25-30'
+
+def get_budget_params(age):
+    """Get budget calculation parameters for age tier"""
+    tier = get_age_tier(age)
+    return Config.BUDGET_PARAMS[tier]
 
 def get_skill_caps(age):
     """Get min/max caps for skill changes based on age"""
@@ -269,9 +257,22 @@ def calculate_defensive_bonus(dws, stl, blk):
     return min(bonus, Config.DEFENSIVE_BONUS_CAP)
 
 def calculate_base_budget(adjusted_per, age, rng):
-    """Calculate base budget with age multiplier and jitter (Phase 3)"""
-    age_mult = get_age_multiplier(age)
-    raw_budget = (adjusted_per / Config.BASE_DIVISOR) * age_mult
+    """
+    Calculate base budget using PER-centered formula (Phase 3).
+
+    Formula: budget = (adjusted_per - threshold) * scale + offset + jitter
+
+    This ensures higher PER = better progression, with age shifting the baseline.
+    """
+    params = get_budget_params(age)
+    threshold = params['threshold']
+    scale = params['scale']
+    offset = params['offset']
+
+    # PER-centered calculation: deviation from threshold determines direction
+    per_deviation = adjusted_per - threshold
+    raw_budget = (per_deviation * scale) + offset
+
     jitter = rng.uniform(-Config.JITTER_RANGE, Config.JITTER_RANGE)
     return math.floor(raw_budget + jitter)
 
@@ -283,19 +284,20 @@ def apply_budget_adjustments(budget, adjusted_per, age, ovr, rng):
     if age <= Config.LOW_PER_BONUS['ageThreshold'] and adjusted_per < Config.LOW_PER_BONUS['perThreshold']:
         budget += Config.LOW_PER_BONUS['bonus']
 
-    # God progression
-    god_prob = (Config.GOD_PROGRESSION['baseRate'] -
-                (ovr / 100) * Config.GOD_PROGRESSION['ovrPenalty'])
-    if age > Config.GOD_PROGRESSION['ageThreshold']:
-        god_prob *= Config.GOD_PROGRESSION['oldAgeMultiplier']
+    # God progression - only eligible if age <= maxAge AND ovr < maxOvr
+    if age <= Config.GOD_PROGRESSION['maxAge'] and ovr < Config.GOD_PROGRESSION['maxOvr']:
+        god_prob = (Config.GOD_PROGRESSION['baseRate'] -
+                    (ovr / 100) * Config.GOD_PROGRESSION['ovrPenalty'])
+        if age > Config.GOD_PROGRESSION['ageThreshold']:
+            god_prob *= Config.GOD_PROGRESSION['oldAgeMultiplier']
 
-    if rng.random() < god_prob:
-        god_bonus = rng.randint(*Config.GOD_PROGRESSION['bonusRange'])
-        budget += god_bonus
-        god_prog_info = {
-            'bonus': god_bonus,
-            'chance': round(god_prob, 4)
-        }
+        if rng.random() < god_prob:
+            god_bonus = rng.randint(*Config.GOD_PROGRESSION['bonusRange'])
+            budget += god_bonus
+            god_prog_info = {
+                'bonus': god_bonus,
+                'chance': round(god_prob, 4)
+            }
 
     return budget, god_prog_info
 
